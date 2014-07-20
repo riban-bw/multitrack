@@ -141,7 +141,7 @@ int main()
         if(bRun)
         {
           string sPlayCommand = "play -q";
-          string sRecCommand = "arecord -I -q -Dsysdefault:CODEC -fcd ";
+          string sRecCommand = "arecord -I -q --buffer-size=100 -Dsysdefault:CODEC -fcd ";
           sRecCommand.append(PATH);
           sRecCommand.append("newrec &");
           int nPlay = 0;
@@ -171,8 +171,6 @@ int main()
             sPlayCommand.append(" --combine mix-power");
           sPlayCommand.append(" -t alsa &");
           //mvprintw(CHANNEL_QUANT + 2, 0, sPlayCommand.c_str()); //debug
-          if(nPlay > 0)
-            system(sPlayCommand.c_str());
           if(-1 != nRecA || -1 != nRecB)
           {
             attron(COLOR_PAIR(1));
@@ -180,13 +178,15 @@ int main()
             attroff(COLOR_PAIR(1));
             system(sRecCommand.c_str());
           }
-          else
+          else if(nPlay > 0)
           {
             attron(COLOR_PAIR(2));
             mvprintw(CHANNEL_QUANT + 2, 0, "PLAY");
             attroff(COLOR_PAIR(1));
             system(sRecCommand.c_str());
           }
+          if(nPlay > 0)
+            system(sPlayCommand.c_str());
         }
         else
         {
