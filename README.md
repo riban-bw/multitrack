@@ -24,4 +24,4 @@ q - Quit
 space - start / stop
 home - move playhead to beginning
 
-Compile with: g++ -lncurses -lasound multitrack.cpp -o multitrack
+Compile with: g++ -std=c++11 -lncurses -lasound multitrack.cpp -o multitrack
