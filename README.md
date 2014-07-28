@@ -17,7 +17,11 @@ m - toggle selected channel mute
 M - toggle all channels mute (make same as channel 1)
 a - toggle record from A (left) input
 b - toggle record from B (right) input
+L - pan fully left
+R - pan fully right
+C - pan centre
 q - Quit
 space - start / stop
+home - move playhead to beginning
 
-Compile with: g++ -lncurses multitrack.cpp -o multitrack
+Compile with: g++ -lncurses -lasound multitrack.cpp -o multitrack
