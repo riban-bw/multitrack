@@ -37,7 +37,8 @@
 			<Add library="ncurses" />
 			<Add library="asound" />
 		</Linker>
-		<Unit filename="main.cpp" />
+		<Unit filename="multitrack.cpp" />
+		<Unit filename="multitrack.h" />
 		<Extensions>
 			<code_completion />
 			<envvars />
