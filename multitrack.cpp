@@ -14,6 +14,18 @@
 *   Tracks are stored in single WAV-RIFF file with (16) channels, 16-bit, (44100) samples per second, little-ended
 */
 
+//!@todo Feature: Soft start and stop to play / record, e.g. fade in / out
+//!@todo Feature: Show track length
+//!@todo Required: Allow recording to extend file size
+//!@todo Required: Rewrite header on save
+//!@todo Required: Remove unused header chuncks
+//!@todo Feature: Add / remove tracks / channels
+//!@todo Bug: Hangs when opening audio device if already in use, e.g. jackd is running
+//!@todo Feature: Show input (and output?) monitoring, particularly overload
+//!@todo Feature: Punch in/out points
+//!@todo Feature: Loop play / record
+
+
 #include <string>
 #include <alsa/asoundlib.h>
 #include <ncurses.h> //provides user interface
@@ -33,6 +45,9 @@ static const int SAMPLERATE     = 44100; //Samples per second
 static const int SAMPLESIZE     = 2; //Quantity of bytes in each sample
 static const int FRAME_SIZE     = 128; //Number of samples in each frame (128 samples at 441000 takes approx 3ms)
 static const int MAX_TRACKS     = 16; //Quantity of mono tracks
+static const int RECORD_LATENCY = 3000; //microseconds of record latency
+static const int REPLAY_LATENCY = 30000; //microseconds of record latency
+
 //Transport control states
 static const int TC_STOP        = 0;
 static const int TC_PLAY        = 1;
@@ -45,36 +60,38 @@ static const int WHITE_BLUE     = 3;
 static const int RED_BLACK      = 4;
 static const int WHITE_MAGENTA  = 5;
 
+static string MIX_LEVEL[17] = {"  0dB", " -6dB", "-12dB", "-18dB", "-24dB", "-30dB", "-36dB", "-42dB", "-48dB", "-54dB", "-60dB", "-66dB", "-72dB", "-78dB", "-84dB", "-90dB", " -Inf"};
+
 /** Class representing single channel audio track **/
 class Track
 {
     public:
-        int nMonMixA = 50; //A-leg monitor mix level (0-100)
-        int nMonMixB = 50; //B-leg monitor mix level (0-100)
+        int nMonMixA = 1; //A-leg monitor mix antenuation level (x 6Db) 0 - 16
+        int nMonMixB = 1; //B-leg monitor mix antenuation level (x 6Db) 0 - 16
         bool bMute = true; //True if track is muted
 
         /** Get the channel A mix down value of sample for this channel
         *   @param  nValue Sample value
-        *   @return <i>int16_t</i> Gain (pad) adjusted value
+        *   @return <i>int16_t</i> Antenuated value
         */
         int16_t MixA(int16_t nValue)
         {
-            if(bMute || 0 == nMonMixA)
+            if(bMute || 16 == nMonMixA)
                 return 0;
             else
-                return (nValue / 100) * nMonMixA;
+                return nValue >> nMonMixA;
         }
 
         /** Get the channel B mix down value of sample for this channel
         *   @param  nValue Sample value
-        *   @return <i>int16_t</i> Gain (pad) adjusted value
+        *   @return <i>int16_t</i> Antenuated adjusted value
         */
         int16_t MixB(int16_t nValue)
         {
-            if(bMute || 0 == nMonMixB)
+            if(bMute || 16 == nMonMixB)
                 return 0;
             else
-                return (nValue / 100) * nMonMixB;
+                return nValue >> nMonMixB;
         }
 };
 
@@ -104,6 +121,7 @@ static int g_nBlockSize; //Size of a single sample of all channels (sample size 
 static int g_nRecA; //Which track is recording A-leg input (-1 = none)
 static int g_nRecB; //Which track is recording B-leg input (-1 = none)
 static int g_nTransport; //Transport control status
+static bool g_bRecordEnabled; //True if recording enabled
 //Tape position (in blocks - one block is one sample of all tracks)
 static int g_nHeadPos; //Position of 'play head' in samples
 static int g_nLastFrame; //Last frame
@@ -165,29 +183,36 @@ void ShowMenu()
         if(g_track[i].bMute)
         {
             wattron(g_pWindowRouting, COLOR_PAIR(RED_BLACK));
-            wprintw(g_pWindowRouting, "    MUTE   ", g_track[i].nMonMixA, g_track[i].nMonMixB);
+            wprintw(g_pWindowRouting, "     MUTE    ", g_track[i].nMonMixA, g_track[i].nMonMixB);
             wattroff(g_pWindowRouting, COLOR_PAIR(RED_BLACK));
         }
         else
-            wprintw(g_pWindowRouting, " L%3d  R%3d", g_track[i].nMonMixA, g_track[i].nMonMixB);
+            wprintw(g_pWindowRouting, " %s  %s", MIX_LEVEL[g_track[i].nMonMixA].c_str(), MIX_LEVEL[g_track[i].nMonMixB].c_str());
     }
     wrefresh(g_pWindowRouting);
     switch(g_nTransport)
     {
         case TC_STOP:
-            attron(COLOR_PAIR(WHITE_MAGENTA));
-            mvprintw(0, 18, "  STOP  ");
-            attroff(COLOR_PAIR(WHITE_MAGENTA));
+            if(g_bRecordEnabled)
+                attron(COLOR_PAIR(WHITE_RED));
+            else
+                attron(COLOR_PAIR(BLACK_GREEN));
+            mvprintw(0, 20, " STOP ");
+            if(g_bRecordEnabled)
+                attroff(COLOR_PAIR(WHITE_RED));
+            else
+                attroff(COLOR_PAIR(BLACK_GREEN));
             break;
         case TC_PLAY:
-            attron(COLOR_PAIR(BLACK_GREEN));
-            mvprintw(0, 18, "  PLAY  ");
-            attroff(COLOR_PAIR(BLACK_GREEN));
-            break;
-        case TC_RECORD:
-            attron(COLOR_PAIR(WHITE_RED));
-            mvprintw(0, 18, " RECORD ");
-            attroff(COLOR_PAIR(WHITE_RED));
+            if(g_bRecordEnabled)
+                attron(COLOR_PAIR(WHITE_RED));
+            else
+                attron(COLOR_PAIR(BLACK_GREEN));
+            mvprintw(0, 20, " PLAY ");
+            if(g_bRecordEnabled)
+                attroff(COLOR_PAIR(WHITE_RED));
+            else
+                attroff(COLOR_PAIR(BLACK_GREEN));
             break;
     }
     refresh();
@@ -198,7 +223,8 @@ void ShowHeadPosition()
     attron(COLOR_PAIR(WHITE_MAGENTA));
     unsigned int nMinutes = g_nHeadPos / g_nSamplerate / 60;
     unsigned int nSeconds = (g_nHeadPos - nMinutes * g_nSamplerate * 60) / g_nSamplerate;
-    mvprintw(0, 0, " Position: %02d:%02d ", nMinutes, nSeconds);
+    unsigned int nMillis = (g_nHeadPos - (nMinutes * 60 + nSeconds) * g_nSamplerate) * 1000 / 44100;
+    mvprintw(0, 0, "Position: %02d:%02d.%03d ", nMinutes, nSeconds, nMillis);
     attroff(COLOR_PAIR(WHITE_MAGENTA));
 }
 
@@ -218,6 +244,7 @@ void HandleControl()
             break;
         case KEY_DOWN:
             //Select next track
+            //!@todo Remove track selection wrap-around
             if(++g_nSelectedTrack >= g_nChannels)
                 g_nSelectedTrack = 0;
             break;
@@ -227,8 +254,8 @@ void HandleControl()
                 g_nSelectedTrack = g_nChannels;
             --g_nSelectedTrack;
             break;
-        case KEY_LEFT:
-            //Decrease monitor level
+        case KEY_RIGHT:
+            //Increase monitor level
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
             else
@@ -239,28 +266,16 @@ void HandleControl()
                     --g_track[g_nSelectedTrack].nMonMixB;
             }
             break;
-        case KEY_RIGHT:
-            //Increase monitor level
+        case KEY_LEFT:
+            //Decrease monitor level
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
             else
             {
-                if(g_track[g_nSelectedTrack].nMonMixA < 100)
+                if(g_track[g_nSelectedTrack].nMonMixA < 16)
                     ++g_track[g_nSelectedTrack].nMonMixA;
-                if(g_track[g_nSelectedTrack].nMonMixB < 100)
+                if(g_track[g_nSelectedTrack].nMonMixB < 16)
                     ++g_track[g_nSelectedTrack].nMonMixB;
-            }
-            break;
-        case KEY_SLEFT:
-            //Pan monitor left
-            if(g_track[g_nSelectedTrack].bMute)
-                g_track[g_nSelectedTrack].bMute = false;
-            else
-            {
-                if(g_track[g_nSelectedTrack].nMonMixA < 100)
-                    ++g_track[g_nSelectedTrack].nMonMixA;
-                if(g_track[g_nSelectedTrack].nMonMixB > 0)
-                    --g_track[g_nSelectedTrack].nMonMixB;
             }
             break;
         case KEY_SRIGHT:
@@ -269,9 +284,21 @@ void HandleControl()
                 g_track[g_nSelectedTrack].bMute = false;
             else
             {
+                if(g_track[g_nSelectedTrack].nMonMixA < 16)
+                    ++g_track[g_nSelectedTrack].nMonMixA;
+                if(g_track[g_nSelectedTrack].nMonMixB > 0)
+                    --g_track[g_nSelectedTrack].nMonMixB;
+            }
+            break;
+        case KEY_SLEFT:
+            //Pan monitor left
+            if(g_track[g_nSelectedTrack].bMute)
+                g_track[g_nSelectedTrack].bMute = false;
+            else
+            {
                 if(g_track[g_nSelectedTrack].nMonMixA > 0)
                     --g_track[g_nSelectedTrack].nMonMixA;
-                if(g_track[g_nSelectedTrack].nMonMixB < 100)
+                if(g_track[g_nSelectedTrack].nMonMixB < 16)
                     ++g_track[g_nSelectedTrack].nMonMixB;
             }
             break;
@@ -279,36 +306,43 @@ void HandleControl()
             //Pan fully left
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
-            g_track[g_nSelectedTrack].nMonMixA = 100;
-            g_track[g_nSelectedTrack].nMonMixB = 0;
+            g_track[g_nSelectedTrack].nMonMixA = 0;
+            g_track[g_nSelectedTrack].nMonMixB = 16;
             break;
         case 'R':
             //Pan fully right
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
-            g_track[g_nSelectedTrack].nMonMixA = 0;
-            g_track[g_nSelectedTrack].nMonMixB = 100;
+            g_track[g_nSelectedTrack].nMonMixA = 16;
+            g_track[g_nSelectedTrack].nMonMixB = 0;
             break;
         case 'l':
             //Pan fully left and pad to fit track count
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
-            g_track[g_nSelectedTrack].nMonMixA = 100 / g_nChannels;
-            g_track[g_nSelectedTrack].nMonMixB = 0;
+            g_track[g_nSelectedTrack].nMonMixA = 4;
+            g_track[g_nSelectedTrack].nMonMixB = 16;
             break;
         case 'r':
             //Pan fully right and pad to fit track count
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
-            g_track[g_nSelectedTrack].nMonMixA = 0;
-            g_track[g_nSelectedTrack].nMonMixB = 100 / g_nChannels;
+            g_track[g_nSelectedTrack].nMonMixA = 16;
+            g_track[g_nSelectedTrack].nMonMixB = 4;
             break;
         case 'C':
             //Pan centre
             if(g_track[g_nSelectedTrack].bMute)
                 g_track[g_nSelectedTrack].bMute = false;
-            g_track[g_nSelectedTrack].nMonMixA = 50;
-            g_track[g_nSelectedTrack].nMonMixB = 50;
+            g_track[g_nSelectedTrack].nMonMixA = 1;
+            g_track[g_nSelectedTrack].nMonMixB = 1;
+            break;
+        case 'c':
+            //Pan centre and pad to fit track count
+            if(g_track[g_nSelectedTrack].bMute)
+                g_track[g_nSelectedTrack].bMute = false;
+            g_track[g_nSelectedTrack].nMonMixA = 4; //!@todo should work out from g_nChannels
+            g_track[g_nSelectedTrack].nMonMixB = 4;
             break;
         case 'a':
             //Toggle record from A
@@ -336,6 +370,14 @@ void HandleControl()
             //Toggle monitor mute
             g_track[g_nSelectedTrack].bMute = !g_track[g_nSelectedTrack].bMute;
             break;
+        case 'M':
+            //Toggle all monitor mute
+            {
+                bool bMute = !g_track[g_nSelectedTrack].bMute;
+                for(int i = 0; i < g_nChannels; ++i)
+                    g_track[i].bMute = bMute;
+            }
+            break;
         case ' ':
             //Start / Stop
             switch(g_nTransport)
@@ -349,19 +391,17 @@ void HandleControl()
                         g_nHeadPos = 0;
                     SetPlayHead(g_nHeadPos);
                     break;
-                case TC_PAUSE:
-                    //Currently paused so need to resume playing / recording
-                    g_nTransport = TC_PLAY;
-                    break;
                 case TC_PLAY:
                     //Currently playing so need to stop
                     CloseReplay();
                     g_nTransport = TC_STOP;
-                    break;
-                case TC_RECORD:
-                    //Currently recording so need to stop
+                    g_bRecordEnabled = false;
                     break;
             }
+            break;
+        case 'G':
+            //Record
+            g_bRecordEnabled = !g_bRecordEnabled;
             break;
         case KEY_HOME:
             //Go to home position
@@ -384,16 +424,27 @@ void HandleControl()
             //Forward 10 seconds
             SetPlayHead(g_nHeadPos + 10 * g_nSamplerate);
             break;
-        case 'c':
+        case 'e':
             //Clear errors
             g_nUnderruns = 0;
             mvprintw(18, 0, "                                                       ");
+            break;
+        case '+':
+            //Increase record offset
+            //!@todo Remove record offset adjustment from user interface
+            g_nRecordOffset += 100;
+            mvprintw(20,0,"Record offset: %d           ", g_nRecordOffset);
+            break;
+        case '-':
+            //Decrease record offset
+            g_nRecordOffset -= 100;
+            mvprintw(20,0,"Record offset: %d           ", g_nRecordOffset);
             break;
         case 'z':
             //Debug
             break;
         default:
-            return;
+            return; //Avoid updating menu if invalid keypress
     }
     ShowMenu();
 }
@@ -526,8 +577,8 @@ bool OpenReplay()
                                   SND_PCM_ACCESS_RW_INTERLEAVED,
                                   2, //2 channels (left & right)
                                   g_nSamplerate,
-                                  1,
-                                  30000)) != 0) //!@todo is 30ms correct latency?
+                                  0, //Don't resample
+                                  REPLAY_LATENCY)) != 0) //!@todo is 30ms correct latency? - Larger latency for fewer underruns 30ms allows Alt-Tab but may be shorter or longer on RPi
     {
         cerr << "Unable to configure replay device: " << snd_strerror(nError) << endl;
         CloseReplay();
@@ -554,8 +605,6 @@ bool OpenRecord()
     if(g_pPcmRecord)
         return true;
 
-        //!@todo Implement OpenRecord
-
     //**Open sound device**
     if((nError = snd_pcm_open(&g_pPcmRecord, g_sPcmRecName.c_str(), SND_PCM_STREAM_CAPTURE, 0)) != 0)
     {
@@ -568,8 +617,8 @@ bool OpenRecord()
                                   SND_PCM_ACCESS_RW_INTERLEAVED,
                                   2, //2 channels (left & right)
                                   g_nSamplerate,
-                                  1,
-                                  30000)) != 0) //!@todo is 30ms correct latency?
+                                  0, //Don't resample
+                                  RECORD_LATENCY)) != 0) //!@todo is 3ms correct latency?
     {
         cerr << "Unable to configure record device: " << snd_strerror(nError) << endl;
         CloseRecord();
@@ -585,12 +634,9 @@ void CloseRecord()
     if(g_pPcmRecord)
         snd_pcm_close(g_pPcmRecord);
     g_pPcmRecord = NULL;
-    if(g_nTransport == TC_RECORD)
-        g_nTransport = TC_PLAY;
     ShowMenu();
 }
 
-//Play audio
 bool Play()
 {
     if(!g_pPcmPlay || (g_nReplayFd < 0) || ((TC_PLAY != g_nTransport) && (TC_RECORD != g_nTransport)))
@@ -653,7 +699,7 @@ bool Play()
 
 bool Record()
 {
-    if(!g_pPcmRecord || (g_nReplayFd < 0) || ((TC_PLAY != g_nTransport) && (TC_RECORD != g_nTransport)))
+    if(!g_bRecordEnabled | !g_pPcmRecord || (g_nReplayFd < 0) || (TC_PLAY != g_nTransport))
         return false;
     if((-1 == g_nRecA) && (-1 == g_nRecB))
         return false; //No record channels primed
@@ -661,7 +707,7 @@ bool Record()
         return true; //Record head not past start of file
     //!@todo Recording may start early if punch-in after start of file
     unsigned char pRecBuffer[2 * SAMPLESIZE * FRAME_SIZE]; // buffer to hold record frame
-//    memset(pRecBuffer, 0, sizeof(pRecBuffer)); //silence record buffer
+    memset(pRecBuffer, 0, sizeof(pRecBuffer)); //silence record buffer
     snd_pcm_sframes_t nBlocks = snd_pcm_readi(g_pPcmRecord, pRecBuffer, FRAME_SIZE);
     switch(nBlocks)
     {
@@ -686,16 +732,18 @@ bool Record()
             break;
     }
     //Write samples to file
-    //!@todo This is causing massive underruns - too much computation?
-    for(unsigned int nSample = 0; nSample < sizeof(pRecBuffer); ++nSample)
+    //!@todo This is causing massive underruns - too much computation? Or is it blocking?
+    for(unsigned int nSample = 0; nSample < FRAME_SIZE; ++nSample)
     {
         if(-1 != g_nRecA)
         {
-            //big endian samples so reverse as we write them to file
-            pwrite(g_nReplayFd, pRecBuffer + nSample * 4 + 1, 1,
+            pwrite(g_nReplayFd, pRecBuffer + nSample * 4, 2,
                 g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nBlockSize  + g_nRecA * SAMPLESIZE);
-            pwrite(g_nReplayFd, pRecBuffer + nSample * 4, 1,
-                1 + g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nBlockSize  + g_nRecA * SAMPLESIZE);
+        }
+        if(-1 != g_nRecB)
+        {
+            pwrite(g_nReplayFd, 2 + pRecBuffer + nSample * 4, 2,
+                2 + g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nBlockSize  + g_nRecA * SAMPLESIZE);
         }
     }
 
@@ -709,6 +757,7 @@ bool LoadProject(string sName)
     //Close existing WAVE file and open new one
     CloseFile();
     CloseReplay();
+    CloseRecord();
     attron(COLOR_PAIR(WHITE_MAGENTA));
     mvprintw(0, 45, "                                                    ");
     attroff(COLOR_PAIR(WHITE_MAGENTA));
@@ -803,7 +852,7 @@ bool SaveProject(string sName)
         fputs(pBuffer , pFile);
         memset(pBuffer, 0, sizeof(pBuffer));
         sprintf(pBuffer, "Rof=%d\n", g_nRecordOffset);
-        fputs(pBuffer , pFile);
+//        fputs(pBuffer , pFile);
 
         fclose(pFile);
         return true;
@@ -815,6 +864,7 @@ int main()
 {
     g_nDebug = 0;
     g_nTransport = TC_STOP;
+    g_bRecordEnabled = false;
     g_nSelectedTrack = 0;
     g_nRecA = -1; //Deselect A-channel recording
     g_nRecB = -1; //Deselect B-channel recording
@@ -822,7 +872,8 @@ int main()
     g_pPcmPlay = NULL;
     g_pPcmRecord = NULL;
     g_nChannels = MAX_TRACKS;
-    g_sPath = "/home/brian/multitrack/";
+    g_nRecordOffset = SAMPLERATE * (RECORD_LATENCY + REPLAY_LATENCY) / 1000000;
+    g_sPath = "/home/brian/multitrack/"; //!@todo replace this absolute path
     initscr();
     noecho();
     curs_set(0);
@@ -859,21 +910,17 @@ int main()
         cerr << "Failed to set terminal attributes" << endl;
     }
 
-
     g_bLoop = true;
 
     while(g_bLoop)
     {
         HandleControl();
-        //Read frame from inputs
-        //Read frame from each track
-        //Write frame to record-primed tracks
-        //Mix each sample to output frame buffers
-        //Write output frame buffers to outputs
         if(!Play() && TC_PLAY == g_nTransport)
             CloseReplay();
         if(!Record() && TC_RECORD == g_nTransport)
             CloseRecord();
+        if(TC_STOP == g_nTransport)
+            usleep(1000);
     }
     CloseReplay();
     CloseRecord();
