@@ -14,7 +14,7 @@ Key commands:
 
 Up / down arrows - select channel
 m - toggle selected channel mute
-M - toggle all channels mute (make same as channel 1)
+M - toggle selected channel mute and set all channels mute the same
 a - toggle record from A (left) input
 b - toggle record from B (right) input
 L - pan fully left
@@ -28,5 +28,8 @@ q - Quit
 space - start / stop
 G - toggle record enable
 home - move playhead to beginning
+end - move playhead to end
 
 Compile with: g++ -std=c++11 multitrack.cpp -o multitrack -lncurses -lasound
+
+Note: Requires g++ 4.7 or later for c++11 support.
