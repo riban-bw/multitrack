@@ -12,6 +12,7 @@
 				<Option type="1" />
 				<Option compiler="gcc" />
 				<Compiler>
+					<Add option="-std=c++11" />
 					<Add option="-g" />
 				</Compiler>
 			</Target>
@@ -29,7 +30,6 @@
 			</Target>
 		</Build>
 		<Compiler>
-			<Add option="-std=c++11" />
 			<Add option="-Wall" />
 			<Add option="-fexceptions" />
 		</Compiler>
@@ -37,6 +37,7 @@
 			<Add library="ncurses" />
 			<Add library="asound" />
 		</Linker>
+		<Unit filename="README.md" />
 		<Unit filename="multitrack.cpp" />
 		<Unit filename="multitrack.h" />
 		<Extensions>

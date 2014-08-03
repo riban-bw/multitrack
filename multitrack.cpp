@@ -137,7 +137,7 @@ static Track g_track[MAX_TRACKS]; //Array of track classes
 static int g_nSamplerate = SAMPLERATE; //Samples per second
 static int g_nFrameSize; //Frame size - size of a single sample of all channels (sample size x quantity of channels)
 static int g_nPeriodSize; //Period size - size of all samples in each period (sample size x quantity of channels x PERIOD_SIZE)
-static char* g_pSilence; //Pointer to block of silent samples
+static char* g_pSilence; //Pointer to one period of silent samples
 //Transport control
 static int g_nRecA; //Which track is recording A-leg input (-1 = none)
 static int g_nRecB; //Which track is recording B-leg input (-1 = none)
@@ -166,6 +166,8 @@ static bool g_bLoop; //True whilst main loop is running
 static int g_fdWave; //File descriptor of replay file
 static int g_nSelectedTrack; //Index of selected track
 int g_nDebug; //General purpose debug integer
+static char* g_pReadBuffer; //Buffer to hold data read from file
+static int16_t g_pWriteBuffer[PERIOD_SIZE * 2]; //Buffer to hold data to be written to audio output device
 
 /** Structure representing RIFF WAVE format chunk header (without id or size, i.e. 8 bytes smaller) **/
 struct WaveHeader
@@ -701,7 +703,8 @@ void CloseReplay()
     if(g_pPcmPlay)
         snd_pcm_close(g_pPcmPlay);
     g_pPcmPlay = NULL;
-    g_nTransport = TC_STOP;
+    if(!g_bRecordEnabled)
+        g_nTransport = TC_STOP;
     ShowMenu();
 }
 
@@ -756,51 +759,31 @@ void CloseRecord()
 
 bool Play()
 {
-    if(!g_pPcmPlay || (g_fdWave < 0) || ((TC_PLAY != g_nTransport) && (TC_RECORD != g_nTransport)))
+    if(!g_pPcmPlay || (g_fdWave < 0) || ((TC_PLAY != g_nTransport)))
         return false;
 
     //Read frame from file
     //!@todo handle different bits/sample size
-    //!@todo optimise - do not create buffer for each frame - use global buffer
-    unsigned char pInBuffer[g_nFrameSize * PERIOD_SIZE]; // buffer to hold input frame: 2 bytes per sample, (16) channels
-    int16_t pOutBuffer[2 * PERIOD_SIZE]; // buffer to hold output frame: 2 channels (stereo output) 16-bit word
-    memset(pOutBuffer, 0, sizeof(pOutBuffer)); //silence output buffer
-    int nRead = read(g_fdWave, pInBuffer, sizeof(pInBuffer));
+    memset(g_pWriteBuffer, 0, sizeof(g_pWriteBuffer)); //silence output buffer
+    int nRead = read(g_fdWave, g_pReadBuffer, g_nPeriodSize);
     bool bPlaying = (nRead > 0); //If we fail to read then we should stop
-    if(g_bRecordEnabled && !bPlaying)
+    //Mix each frame to output buffer
+    //iterate through input buffer one frame at a time, adding gain-adjusted value to output buffer
+    for(int nPos = 0; nPos < nRead ; nPos += g_nFrameSize)
     {
-        //extend file if recording
-        ssize_t nWritten = pwrite(g_fdWave, g_pSilence, g_nPeriodSize, g_offEndOfData);
-        if(nWritten > 0)
+        for(int nChan = 0; nChan < g_nChannels; ++nChan)
         {
-            g_offEndOfData += nWritten;
-            bPlaying = true;
-        }
-        else
-            cerr << "Failed to extend file" << endl;
-        g_nHeadPos += g_nFrameSize;
-    }
-    else
-    {
-        //Only need to mixdown if not recording beyond end of file (else silence added)
-        //Mix each frame to output buffer
-        //iterate through input buffer one frame at a time, adding gain-adjusted value to output buffer
-        for(int nPos = 0; nPos < nRead ; nPos += g_nFrameSize)
-        {
-            for(int nChan = 0; nChan < g_nChannels; ++nChan)
-            {
-                uint16_t nSample = pInBuffer[nPos + (SAMPLESIZE * nChan)] + (pInBuffer[nPos + (SAMPLESIZE * nChan) + 1] << 8); //get little endian sample into 16-bit word
-                pOutBuffer[nPos / g_nChannels] += g_track[nChan].MixA(nSample);
-                pOutBuffer[nPos / g_nChannels + 1] += g_track[nChan].MixB(nSample);
-            }
-            ++g_nHeadPos; //Move one frame forward
+            uint16_t nSample = g_pReadBuffer[nPos + (SAMPLESIZE * nChan)] + (g_pReadBuffer[nPos + (SAMPLESIZE * nChan) + 1] << 8); //get little endian sample into 16-bit word
+            g_pWriteBuffer[nPos / g_nChannels] += g_track[nChan].MixA(nSample);
+            g_pWriteBuffer[nPos / g_nChannels + 1] += g_track[nChan].MixB(nSample);
         }
     }
     snd_pcm_sframes_t nBlocks;
     //Send output buffer to soundcard replay output
     if(bPlaying)
     {
-        nBlocks = snd_pcm_writei(g_pPcmPlay, pOutBuffer, PERIOD_SIZE);
+        g_nHeadPos += PERIOD_SIZE;
+        nBlocks = snd_pcm_writei(g_pPcmPlay, g_pWriteBuffer, PERIOD_SIZE);
         switch(nBlocks)
         {
             case -EBADFD:
@@ -844,6 +827,20 @@ bool Record()
     if(!g_pPcmRecord && !OpenRecord())
         return false; //Record device not open and failed to open when we tried - oops!
     //!@todo Optimse - do not create record buffer for each frame - use global buffer
+    if(g_nHeadPos >= g_nLastFrame)
+    {
+        //extend file if recording
+        ssize_t nWritten = pwrite(g_fdWave, g_pSilence, g_nPeriodSize, g_offEndOfData);
+        if(nWritten > 0)
+        {
+            g_offEndOfData += nWritten;
+            g_nLastFrame += PERIOD_SIZE;;
+        }
+        else
+            cerr << "Failed to extend file" << endl;
+    }
+
+
     unsigned char pRecBuffer[2 * SAMPLESIZE * PERIOD_SIZE]; // buffer to hold record frame
     memset(pRecBuffer, 0, sizeof(pRecBuffer)); //silence record buffer
     snd_pcm_sframes_t nBlocks = snd_pcm_readi(g_pPcmRecord, pRecBuffer, PERIOD_SIZE);
@@ -870,26 +867,24 @@ bool Record()
             break;
     }
     //Write samples to file
-    //!@todo Optimise - do not create rewrite buffer for each frame - use global buffer
-    char pRewriteBuffer[g_nPeriodSize];
     off_t offRewrite = g_offStartOfData + (g_nHeadPos - g_nRecordOffset) * g_nFrameSize;
-    int nRead = pread(g_fdWave, pRewriteBuffer, g_nPeriodSize, offRewrite);
+    int nRead = pread(g_fdWave, g_pReadBuffer, g_nPeriodSize, offRewrite);
     for(unsigned int nSample = 0; nSample < PERIOD_SIZE; ++nSample)
     {
         if(-1 != g_nRecA)
         {
-            memcpy(pRewriteBuffer + nSample * g_nFrameSize + (g_nRecA * SAMPLESIZE), (pRecBuffer + nSample * 4), SAMPLESIZE);
+            memcpy(g_pReadBuffer + nSample * g_nFrameSize + (g_nRecA * SAMPLESIZE), (pRecBuffer + nSample * 4), SAMPLESIZE);
 //            pwrite(g_fdWave, pRecBuffer + nSample * 4, 2,
 //                g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nFrameSize  + g_nRecA * SAMPLESIZE);
         }
         if(-1 != g_nRecB)
         {
-            memcpy(pRewriteBuffer + 2 + nSample * g_nFrameSize + (g_nRecA * SAMPLESIZE), (pRecBuffer + 2 + nSample * 4), SAMPLESIZE);
+            memcpy(g_pReadBuffer + 2 + nSample * g_nFrameSize + (g_nRecA * SAMPLESIZE), (pRecBuffer + 2 + nSample * 4), SAMPLESIZE);
 //            pwrite(g_fdWave, 2 + pRecBuffer + nSample * 4, 2,
 //                2 + g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nFrameSize  + g_nRecA * SAMPLESIZE);
         }
     }
-    pwrite(g_fdWave, pRewriteBuffer, nRead, offRewrite);
+    pwrite(g_fdWave, g_pReadBuffer, nRead, offRewrite);
     return true;
 }
 
@@ -947,12 +942,15 @@ bool LoadProject(string sName)
         fclose(pFile);
     }
     SetPlayHead(g_nHeadPos);
-
-    delete g_pSilence;
     g_nPeriodSize = g_nFrameSize * PERIOD_SIZE;
-    g_pSilence = new char[g_nPeriodSize];
-    memset(g_pSilence, 0, sizeof(g_nPeriodSize));
     g_nRecordOffset = g_nSamplerate * (RECORD_LATENCY + REPLAY_LATENCY) / 1000000;
+    //Create new silent period
+    delete[] g_pSilence;
+    g_pSilence = new char[g_nPeriodSize];
+    memset(g_pSilence, 0, g_nPeriodSize);
+    //Create new read buffer
+    delete[] g_pReadBuffer;
+    g_pReadBuffer = new char[g_nPeriodSize];
     return true;
 }
 
@@ -982,7 +980,6 @@ bool SaveProject(string sName)
     if(pFile)
     {
         char pBuffer[32];
-        cout << "channels: " << g_nChannels;
         for(int i = 0; i < g_nChannels; ++i)
         {
             memset(pBuffer, 0, sizeof(pBuffer));
@@ -1020,6 +1017,7 @@ int main()
     g_pPcmPlay = NULL;
     g_pPcmRecord = NULL;
     g_pSilence = NULL;
+    g_pReadBuffer = NULL;
     g_nChannels = MAX_TRACKS;
     g_nRecordOffset = SAMPLERATE * (RECORD_LATENCY + REPLAY_LATENCY) / 1000000;
     g_sPath = "/media/multitrack/"; //!@todo replace this absolute path
@@ -1065,7 +1063,7 @@ int main()
         HandleControl();
         if(!Play() && TC_PLAY == g_nTransport)
             CloseReplay();
-        if(!Record() && TC_RECORD == g_nTransport)
+        if(!Record())
             CloseRecord();
         if(TC_STOP == g_nTransport)
             usleep(1000);
@@ -1074,7 +1072,8 @@ int main()
     CloseRecord();
     SaveProject();
     CloseFile();
-    delete g_pSilence;
+    delete[] g_pSilence;
+    delete[] g_pReadBuffer;
     endwin();
     return 0;
 }
