@@ -10,9 +10,9 @@ Can record one or two channels of audio whilst playing back any / all tacks, mix
 
 There is a ncurses user interface, purposefully kept simple. It is intended to add other interfaces such as hardware buttons, MIDI, network, etc.
 
-Key commands:
+Key commands (subject to change):
 
-Up / down arrows - select channel
+up / down arrows - select channel
 m - toggle selected channel mute
 M - toggle selected channel mute and set all channels mute the same
 a - toggle record from A (left) input
@@ -30,6 +30,8 @@ G - toggle record enable
 home - move playhead to beginning
 end - move playhead to end
 
-Compile with: g++ -std=c++11 multitrack.cpp -o multitrack -lncurses -lasound
-
+Compile with:
+    g++ -std=c++11 multitrack.cpp -o multitrack -lncurses -lasound
+or:
+    make
 Note: Requires g++ 4.7 or later for c++11 support.

@@ -16,7 +16,6 @@
 
 //!@todo Feature: Soft start and stop to play / record, e.g. fade in / out
 //!@todo Feature: Show track length
-//!@todo Required: Allow recording to extend file size
 //!@todo Required: Rewrite header on save
 //!@todo Required: Remove unused header chuncks
 //!@todo Feature: Add / remove tracks / channels
@@ -24,9 +23,7 @@
 //!@todo Feature: Show input (and output?) monitoring, particularly overload
 //!@todo Feature: Punch in/out points
 //!@todo Feature: Loop play / record
-//!@todo Bug: Does not handle missing WAVE files gracefully
-//!@todo Bug: Record past end of file. Stop. Press 'END'. Moves to previous end of track not new end of track
-//!@todo Bug: Record past end of file does not record correct audio.
+//!@todo Bug: Head position shows beyond actual stop position, e.g. play to end of file - postion shows beyond end of file (a few ms) - see comment in Play() about using nBlock
 
 #include <string>
 #include <alsa/asoundlib.h>
@@ -129,6 +126,7 @@ static bool Play(); //Replay one frame of audio
 static bool Record(); //Record one frame of audio
 static bool LoadProject(string sName); //Loads a project called sName
 static bool SaveProject(string sName = ""); //Loads a project called sName
+static void WriteHeader(unsigned int nWaveSize); //Writes the RIFF header
 
 //Global variables
 static int g_nChannels; //Number of channels in replay file
@@ -144,7 +142,7 @@ static int g_nRecB; //Which track is recording B-leg input (-1 = none)
 static int g_nTransport; //Transport control status
 static bool g_bRecordEnabled; //True if recording enabled
 //Tape position (in blocks - one block is one sample of all tracks)
-static int g_nHeadPos; //Position of 'play head' in frames
+static long g_lHeadPos; //Position of 'play head' in frames
 static int g_nLastFrame; //Last frame
 static int g_nRecordOffset; //Quantity of frames delay between replay and record
 static unsigned int g_nUnderruns; //Quantity of replay buffer underruns
@@ -166,8 +164,8 @@ static bool g_bLoop; //True whilst main loop is running
 static int g_fdWave; //File descriptor of replay file
 static int g_nSelectedTrack; //Index of selected track
 int g_nDebug; //General purpose debug integer
-static char* g_pReadBuffer; //Buffer to hold data read from file
-static int16_t g_pWriteBuffer[PERIOD_SIZE * 2]; //Buffer to hold data to be written to audio output device
+static unsigned char* g_pReadBuffer; //Buffer to hold data read from file
+static int16_t g_pPlayBuffer[PERIOD_SIZE * 2]; //Buffer to hold data to be written to audio output device
 
 /** Structure representing RIFF WAVE format chunk header (without id or size, i.e. 8 bytes smaller) **/
 struct WaveHeader
@@ -245,9 +243,9 @@ void ShowMenu()
 void ShowHeadPosition()
 {
     attron(COLOR_PAIR(WHITE_MAGENTA));
-    unsigned int nMinutes = g_nHeadPos / g_nSamplerate / 60;
-    unsigned int nSeconds = (g_nHeadPos - nMinutes * g_nSamplerate * 60) / g_nSamplerate;
-    unsigned int nMillis = (g_nHeadPos - (nMinutes * 60 + nSeconds) * g_nSamplerate) * 1000 / 44100;
+    unsigned int nMinutes = g_lHeadPos / g_nSamplerate / 60;
+    unsigned int nSeconds = (g_lHeadPos - nMinutes * g_nSamplerate * 60) / g_nSamplerate;
+    unsigned int nMillis = (g_lHeadPos - (nMinutes * 60 + nSeconds) * g_nSamplerate) * 1000 / 44100;
     mvprintw(0, 0, "Position: %02d:%02d.%03d ", nMinutes, nSeconds, nMillis);
     attroff(COLOR_PAIR(WHITE_MAGENTA));
 }
@@ -423,9 +421,9 @@ void HandleControl()
                     if(OpenReplay())
                         g_nTransport = TC_PLAY;
                     //!@todo Configure whether auto return to zero when playing from end of track
-                    if(!g_bRecordEnabled && g_nHeadPos >= g_nLastFrame)
-                        g_nHeadPos = 0;
-                    SetPlayHead(g_nHeadPos);
+                    if(!g_bRecordEnabled && g_lHeadPos >= g_nLastFrame)
+                        g_lHeadPos = 0;
+                    SetPlayHead(g_lHeadPos);
                     break;
                 case TC_PLAY:
                     //Currently playing so need to stop
@@ -453,19 +451,19 @@ void HandleControl()
             break;
         case ',':
             //Back 1 seconds
-            SetPlayHead(g_nHeadPos - 1 * g_nSamplerate);
+            SetPlayHead(g_lHeadPos - 1 * g_nSamplerate);
             break;
         case '.':
             //Forward 1 seconds
-            SetPlayHead(g_nHeadPos + 1 * g_nSamplerate);
+            SetPlayHead(g_lHeadPos + 1 * g_nSamplerate);
             break;
         case '<':
             //Back 10 seconds
-            SetPlayHead(g_nHeadPos - 10 * g_nSamplerate);
+            SetPlayHead(g_lHeadPos - 10 * g_nSamplerate);
             break;
         case '>':
             //Forward 10 seconds
-            SetPlayHead(g_nHeadPos + 10 * g_nSamplerate);
+            SetPlayHead(g_lHeadPos + 10 * g_nSamplerate);
             break;
         case 'e':
             //Clear errors
@@ -510,31 +508,25 @@ bool OpenFile()
         g_fdWave = open(sFilename.c_str(), O_RDWR | O_CREAT, 0644);
         if(g_fdWave <= 0)
         {
-            cerr << "Unable to open file" << sFilename << " - error " << errno << endl;
+            cerr << "Unable to open or create file" << sFilename << " - error " << errno << endl;
             CloseReplay();
             return false;
         }
 
         //**Read RIFF headers**
         char pBuffer[12];
-        if(read(g_fdWave, pBuffer, 12) < 12)
+        if((read(g_fdWave, pBuffer, 12) < 12) || (0 != strncmp(pBuffer, "RIFF", 4)) || (0 != strncmp(pBuffer + 8, "WAVE", 4)))
         {
-            //!@todo Write header if not existing, e.g. create new file
-            cerr << "Replay file not RIFF - too small" << endl;
-            CloseReplay();
-            return false;
-        }
-        if(0 != strncmp(pBuffer, "RIFF", 4))
-        {
-            cerr << "Not RIFF" << endl;
-            CloseReplay();
-            return false;
-        }
-        if(0 != strncmp(pBuffer + 8, "WAVE", 4))
-        {
-            cerr << "Not WAVE" << endl;
-            CloseReplay();
-            return false;
+            //Invalid file so create a WAVE file with 4 seconds of silence
+            g_nChannels = MAX_TRACKS;
+            g_nSamplerate = SAMPLERATE;
+            size_t nWaveSize = g_nSamplerate * g_nChannels * SAMPLESIZE * 4;
+            WriteHeader(nWaveSize);
+            unsigned char pSilentBuffer[nWaveSize];
+            memset(pSilentBuffer, 0, nWaveSize);
+            pwrite(g_fdWave, pSilentBuffer, nWaveSize, 44);
+            ftruncate(g_fdWave, 44 + nWaveSize);
+            lseek(g_fdWave, 12, SEEK_SET);
         }
 
         char pWaveBuffer[sizeof(WaveHeader)];
@@ -584,18 +576,7 @@ bool OpenFile()
                     refresh();
                     //Use minimal RIFF header - write new header, move wave data then truncate file
                     off_t nWaveSize = g_offEndOfData - g_offStartOfData;
-                    char pHeader[20];
-                    strncpy(pHeader, "RIFF", 4);
-                    SetLE32(pHeader + 4, nWaveSize + 36); //size of RIFF chunck
-                    strncpy(pHeader + 8, "WAVE", 4);
-                    strncpy(pHeader + 12, "fmt ", 4); //start of format chunk
-                    SetLE32(pHeader + 16, 16); //size of format chunck
-                    pwrite(g_fdWave, pHeader, 20, 0);
-                    pWaveHeader->nAudioFormat = 1; //PCM
-                    pwrite(g_fdWave, pWaveBuffer, 16, 20);
-                    strncpy(pHeader, "data", 4);
-                    SetLE32(pHeader + 4, nWaveSize);
-                    pwrite(g_fdWave, pHeader, 8, 36);
+                    WriteHeader(nWaveSize);
                     char pData[512];
                     off_t offRead = g_offStartOfData;
                     off_t offWrite = 44;
@@ -603,7 +584,7 @@ bool OpenFile()
                     int nProgress = 0;
                     while((nRead = pread(g_fdWave, pData, sizeof(pData), offRead)) > 0)
                     {
-                        pwrite(g_fdWave, pData, sizeof(pData), offWrite);
+                        pwrite(g_fdWave, pData, nRead, offWrite);
                         offWrite += nRead;
                         offRead += nRead;
                         int nProgressTemp = 100 * offRead / nWaveSize;
@@ -619,7 +600,6 @@ bool OpenFile()
                     }
                     ftruncate(g_fdWave, 44 + nWaveSize);
                     g_offStartOfData = 44;
-                    //!@todo Show indication of file changing and progress bar
                     move(18, 0);
                     clrtoeol();
                     move(19, 0);
@@ -637,6 +617,30 @@ bool OpenFile()
         cerr << "Failed to get WAVE header";
     }
     return false;
+}
+
+//Write header
+void WriteHeader(unsigned int nWaveSize)
+{
+    if(g_fdWave <= 0)
+        return;
+    //Use minimal RIFF header - write new header, move wave data then truncate file
+    char pHeader[36];
+    strncpy(pHeader, "RIFF", 4);
+    SetLE32(pHeader + 4, nWaveSize + 36); //size of RIFF chunck
+    strncpy(pHeader + 8, "WAVE", 4);
+    strncpy(pHeader + 12, "fmt ", 4); //start of format chunk
+    SetLE32(pHeader + 16, 16); //size of format chunck
+    SetLE16(pHeader + 20, 1); //Audio format = PCM
+    SetLE16(pHeader + 22, g_nChannels); //Number of channesl
+    SetLE32(pHeader + 24, g_nSamplerate);
+    SetLE32(pHeader + 28, g_nSamplerate * g_nChannels * SAMPLESIZE); //Sample rate
+    SetLE16(pHeader + 32, g_nChannels * SAMPLESIZE); //Block align == frame size
+    SetLE16(pHeader + 34, SAMPLESIZE * 8); //Bits per sample
+    pwrite(g_fdWave, pHeader, sizeof(pHeader), 0);
+    strncpy(pHeader, "data", 4);
+    SetLE32(pHeader + 4, nWaveSize);
+    pwrite(g_fdWave, pHeader, 8, 36);
 }
 
 //Closes WAVE file
@@ -657,13 +661,13 @@ void CloseFile()
 
 void SetPlayHead(int nPosition)
 {
-    g_nHeadPos = nPosition;
-    if(g_nHeadPos < 0)
-        g_nHeadPos = 0;
-    if(g_nHeadPos > g_nLastFrame)
-        g_nHeadPos = g_nLastFrame;
+    g_lHeadPos = nPosition;
+    if(g_lHeadPos < 0)
+        g_lHeadPos = 0;
+    if(g_lHeadPos > g_nLastFrame)
+        g_lHeadPos = g_nLastFrame;
     if(g_fdWave > 0)
-        lseek(g_fdWave, g_offStartOfData + g_nHeadPos * g_nFrameSize, SEEK_SET);
+        lseek(g_fdWave, g_offStartOfData + g_lHeadPos * g_nFrameSize, SEEK_SET);
     ShowHeadPosition();
 }
 
@@ -749,12 +753,10 @@ void CloseRecord()
     if(g_pPcmRecord)
         snd_pcm_close(g_pPcmRecord);
     g_pPcmRecord = NULL;
-    //!@todo Probably need to disable recording in tracks elsewhere
     if(g_nRecA > -1)
         g_track[g_nRecA].bRecording = false;
     if(g_nRecB > -1)
         g_track[g_nRecB].bRecording = false;
-    ShowMenu();
 }
 
 bool Play()
@@ -764,26 +766,25 @@ bool Play()
 
     //Read frame from file
     //!@todo handle different bits/sample size
-    memset(g_pWriteBuffer, 0, sizeof(g_pWriteBuffer)); //silence output buffer
+    memset(g_pPlayBuffer, 0, sizeof(g_pPlayBuffer)); //silence output buffer
     int nRead = read(g_fdWave, g_pReadBuffer, g_nPeriodSize);
     bool bPlaying = (nRead > 0); //If we fail to read then we should stop
-    //Mix each frame to output buffer
-    //iterate through input buffer one frame at a time, adding gain-adjusted value to output buffer
-    for(int nPos = 0; nPos < nRead ; nPos += g_nFrameSize)
-    {
-        for(int nChan = 0; nChan < g_nChannels; ++nChan)
-        {
-            uint16_t nSample = g_pReadBuffer[nPos + (SAMPLESIZE * nChan)] + (g_pReadBuffer[nPos + (SAMPLESIZE * nChan) + 1] << 8); //get little endian sample into 16-bit word
-            g_pWriteBuffer[nPos / g_nChannels] += g_track[nChan].MixA(nSample);
-            g_pWriteBuffer[nPos / g_nChannels + 1] += g_track[nChan].MixB(nSample);
-        }
-    }
-    snd_pcm_sframes_t nBlocks;
-    //Send output buffer to soundcard replay output
     if(bPlaying)
     {
-        g_nHeadPos += PERIOD_SIZE;
-        nBlocks = snd_pcm_writei(g_pPcmPlay, g_pWriteBuffer, PERIOD_SIZE);
+        //Mix each frame to output buffer
+        //iterate through input buffer one frame at a time, adding gain-adjusted value to output buffer
+        for(int nPos = 0; nPos < nRead ; nPos += g_nFrameSize)
+        {
+            for(int nChan = 0; nChan < g_nChannels; ++nChan)
+            {
+                int16_t nSample = g_pReadBuffer[nPos + (SAMPLESIZE * nChan)] + (g_pReadBuffer[nPos + (SAMPLESIZE * nChan) + 1] << 8); //get little endian sample into 16-bit word
+                g_pPlayBuffer[nPos / g_nChannels] += g_track[nChan].MixA(nSample);
+                g_pPlayBuffer[nPos / g_nChannels + 1] += g_track[nChan].MixB(nSample);
+            }
+        }
+        snd_pcm_sframes_t nBlocks;
+        //Send output buffer to soundcard replay output
+        nBlocks = snd_pcm_writei(g_pPcmPlay, g_pPlayBuffer, PERIOD_SIZE);
         switch(nBlocks)
         {
             case -EBADFD:
@@ -806,6 +807,7 @@ bool Play()
                 snd_pcm_recover(g_pPcmPlay, nBlocks, 1); //Attempt to recover from error
                 break;
         }
+        g_lHeadPos += nBlocks; //!@todo This gives (a couple of ms) too high head position. nRead/g_nFrameSize is correct but extra cpu
     }
     ShowHeadPosition();
     //Return true if more to play else false if at end of file. Don't fail if we are in record mode
@@ -822,12 +824,11 @@ bool Record()
         return false; //WAVE file not open so nothing to record to
     if((-1 == g_nRecA) && (-1 == g_nRecB))
         return false; //No record channels primed
-    if(g_nHeadPos < g_nRecordOffset)
+    if(g_lHeadPos < g_nRecordOffset)
         return true; //Record head not past start of file
     if(!g_pPcmRecord && !OpenRecord())
         return false; //Record device not open and failed to open when we tried - oops!
-    //!@todo Optimse - do not create record buffer for each frame - use global buffer
-    if(g_nHeadPos >= g_nLastFrame)
+    if(g_lHeadPos >= g_nLastFrame)
     {
         //extend file if recording
         ssize_t nWritten = pwrite(g_fdWave, g_pSilence, g_nPeriodSize, g_offEndOfData);
@@ -867,21 +868,23 @@ bool Record()
             break;
     }
     //Write samples to file
-    off_t offRewrite = g_offStartOfData + (g_nHeadPos - g_nRecordOffset) * g_nFrameSize;
-    int nRead = pread(g_fdWave, g_pReadBuffer, g_nPeriodSize, offRewrite);
-    for(unsigned int nSample = 0; nSample < PERIOD_SIZE; ++nSample)
+    off_t offRewrite = g_offStartOfData + (g_lHeadPos - g_nRecordOffset) * g_nFrameSize;
+    ssize_t nRead = pread(g_fdWave, g_pReadBuffer, g_nPeriodSize, offRewrite);
+    if(nRead != g_nPeriodSize)
+        return false; //Failed to read frame of data
+    for(size_t nSample = 0; nSample < PERIOD_SIZE; ++nSample)
     {
         if(-1 != g_nRecA)
         {
             memcpy(g_pReadBuffer + nSample * g_nFrameSize + (g_nRecA * SAMPLESIZE), (pRecBuffer + nSample * 4), SAMPLESIZE);
 //            pwrite(g_fdWave, pRecBuffer + nSample * 4, 2,
-//                g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nFrameSize  + g_nRecA * SAMPLESIZE);
+//                g_offStartOfData + (g_lHeadPos + nSample - g_nRecordOffset) * g_nFrameSize  + g_nRecA * SAMPLESIZE);
         }
         if(-1 != g_nRecB)
         {
             memcpy(g_pReadBuffer + 2 + nSample * g_nFrameSize + (g_nRecA * SAMPLESIZE), (pRecBuffer + 2 + nSample * 4), SAMPLESIZE);
 //            pwrite(g_fdWave, 2 + pRecBuffer + nSample * 4, 2,
-//                2 + g_offStartOfData + (g_nHeadPos + nSample - g_nRecordOffset) * g_nFrameSize  + g_nRecA * SAMPLESIZE);
+//                2 + g_offStartOfData + (g_lHeadPos + nSample - g_nRecordOffset) * g_nFrameSize  + g_nRecA * SAMPLESIZE);
         }
     }
     pwrite(g_fdWave, g_pReadBuffer, nRead, offRewrite);
@@ -895,9 +898,10 @@ bool LoadProject(string sName)
     CloseFile();
     CloseReplay();
     CloseRecord();
-    attron(COLOR_PAIR(WHITE_MAGENTA));
-    mvprintw(0, 45, "                                                    ");
-    attroff(COLOR_PAIR(WHITE_MAGENTA));
+//    attron(COLOR_PAIR(WHITE_MAGENTA));
+    move(0, 45);
+    clrtoeol();
+//    attroff(COLOR_PAIR(WHITE_MAGENTA));
     g_sProject = sName;
     if(!OpenFile())
         return false;
@@ -935,13 +939,13 @@ bool LoadProject(string sName)
                 }
             }
             if(0 == strncmp(pLine, "Pos=", 4))
-                g_nHeadPos = atoi(pLine + 4); //Set transport position
+                g_lHeadPos = atoi(pLine + 4); //Set transport position
             if(0 == strncmp(pLine, "Rof=", 4))
                 g_nRecordOffset = atoi(pLine + 4); //Set record offset
         }
         fclose(pFile);
     }
-    SetPlayHead(g_nHeadPos);
+    SetPlayHead(g_lHeadPos);
     g_nPeriodSize = g_nFrameSize * PERIOD_SIZE;
     g_nRecordOffset = g_nSamplerate * (RECORD_LATENCY + REPLAY_LATENCY) / 1000000;
     //Create new silent period
@@ -950,7 +954,7 @@ bool LoadProject(string sName)
     memset(g_pSilence, 0, g_nPeriodSize);
     //Create new read buffer
     delete[] g_pReadBuffer;
-    g_pReadBuffer = new char[g_nPeriodSize];
+    g_pReadBuffer = new unsigned char[g_nPeriodSize];
     return true;
 }
 
@@ -993,7 +997,7 @@ bool SaveProject(string sName)
             fputs(pBuffer , pFile);
         }
         memset(pBuffer, 0, sizeof(pBuffer));
-        sprintf(pBuffer, "Pos=%d\n", g_nHeadPos);
+        sprintf(pBuffer, "Pos=%ld\n", g_lHeadPos);
         fputs(pBuffer , pFile);
         memset(pBuffer, 0, sizeof(pBuffer));
         sprintf(pBuffer, "Rof=%d\n", g_nRecordOffset);
@@ -1061,10 +1065,10 @@ int main()
     while(g_bLoop)
     {
         HandleControl();
-        if(!Play() && TC_PLAY == g_nTransport)
-            CloseReplay();
         if(!Record())
             CloseRecord();
+        if(!Play() && TC_PLAY == g_nTransport)
+            CloseReplay();
         if(TC_STOP == g_nTransport)
             usleep(1000);
     }
